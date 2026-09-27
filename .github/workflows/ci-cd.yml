@@ -1,0 +1,162 @@
+# CI/CD Pipeline -- ci-cd-demo
+# Runs on a GitHub Self-hosted Runner: lint -> test -> build image -> deploy -> summary
+
+name: CI/CD Pipeline with Self-hosted Runner
+
+on:
+  push:
+    branches: ['**']        # Every push runs the full pipeline
+  workflow_dispatch:        # Allow manual run from GitHub UI
+
+env:
+  IMAGE_NAME: ci-cd-demo
+  CONTAINER_NAME: python-app
+  APP_PORT: 5001
+
+jobs:
+  # JOB 1: Code quality check
+  lint-and-format:
+    name: Code Quality Check
+    runs-on: self-hosted
+    steps:
+      - name: Checkout source code
+        uses: actions/checkout@v4
+
+      - name: Set up Python virtualenv
+        run: |
+          python3 --version
+          python3 -m venv .venv
+          .venv/bin/python -m pip install --upgrade pip
+          .venv/bin/pip install -r requirements-dev.txt
+
+      - name: Run flake8 linter
+        run: |
+          # --max-line-length=120: allows lines up to 120 characters
+          .venv/bin/flake8 app.py src/ tests/ --max-line-length=120 --statistics
+
+  # JOB 2: Run Unit Tests
+  run-tests:
+    name: Run Unit Tests
+    runs-on: self-hosted
+    needs: lint-and-format
+    steps:
+      - name: Checkout source code
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          python3 -m venv .venv
+          .venv/bin/python -m pip install --upgrade pip
+          .venv/bin/pip install -r requirements.txt
+
+      - name: Run tests with coverage report
+        run: |
+          .venv/bin/python -m pytest tests/ -v \
+            --cov=src --cov=app \
+            --cov-report=term-missing \
+            --cov-report=xml:coverage.xml
+
+      - name: Upload coverage report
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: coverage-report
+          path: coverage.xml
+          if-no-files-found: ignore
+
+  # JOB 3: Build Docker image
+  build:
+    name: Build Docker Image
+    runs-on: self-hosted
+    needs: run-tests
+    steps:
+      - name: Checkout source code
+        uses: actions/checkout@v4
+
+      - name: Add Docker to PATH
+        # Runner started as a service (launchd/systemd) does not load the shell profile
+        run: |
+          echo "/usr/local/bin" >> "$GITHUB_PATH"
+          echo "/opt/homebrew/bin" >> "$GITHUB_PATH"
+          echo "/Applications/Docker.app/Contents/Resources/bin" >> "$GITHUB_PATH"
+
+      - name: Check Docker daemon
+        run: docker info --format 'Docker {{.ServerVersion}} on {{.OperatingSystem}}'
+
+      - name: Build Docker image
+        run: |
+          docker build \
+            -t "$IMAGE_NAME:latest" \
+            -t "$IMAGE_NAME:${GITHUB_SHA::7}" .
+          docker images "$IMAGE_NAME"
+
+  # JOB 4: Deploy to localhost
+  deploy:
+    name: Deploy to localhost
+    runs-on: self-hosted
+    needs: build
+    concurrency:
+      group: deploy-localhost
+      cancel-in-progress: false
+    steps:
+      - name: Add Docker to PATH
+        run: |
+          echo "/usr/local/bin" >> "$GITHUB_PATH"
+          echo "/opt/homebrew/bin" >> "$GITHUB_PATH"
+          echo "/Applications/Docker.app/Contents/Resources/bin" >> "$GITHUB_PATH"
+
+      - name: Remove old container
+        run: docker rm -f "$CONTAINER_NAME" || true
+
+      - name: Start new container
+        run: |
+          docker run -d --name "$CONTAINER_NAME" \
+            -p "$APP_PORT:5001" \
+            --restart unless-stopped \
+            "$IMAGE_NAME:latest"
+
+      - name: Health check
+        run: |
+          for i in $(seq 1 15); do
+            if curl -fsS "http://localhost:$APP_PORT/health"; then
+              echo ""
+              echo "Deployment successful"
+              exit 0
+            fi
+            echo "Waiting for app to start ($i/15)..."
+            sleep 2
+          done
+          echo "Health check failed"
+          docker logs "$CONTAINER_NAME"
+          exit 1
+
+      - name: Show running container
+        run: docker ps --filter "name=$CONTAINER_NAME"
+
+  # JOB 5: Build Summary
+  build-summary:
+    name: Build Summary
+    runs-on: self-hosted
+    needs: [lint-and-format, run-tests, build, deploy]
+    if: always()
+    steps:
+      - name: Print results
+        run: |
+          echo "lint   : ${{ needs.lint-and-format.result }}"
+          echo "tests  : ${{ needs.run-tests.result }}"
+          echo "build  : ${{ needs.build.result }}"
+          echo "deploy : ${{ needs.deploy.result }}"
+
+      - name: Print success message
+        if: ${{ !contains(needs.*.result, 'failure') && !contains(needs.*.result, 'cancelled') }}
+        run: |
+          echo '================================'
+          echo ' CI/CD PIPELINE PASSED!'
+          echo '================================'
+
+      - name: Print failure message
+        if: ${{ contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled') }}
+        run: |
+          echo ' CI/CD PIPELINE FAILED!'
+          echo ' Check logs to identify errors.'
+          exit 1

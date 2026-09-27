@@ -1,0 +1,9 @@
+.git
+.github
+.venv
+actions-runner
+tests
+__pycache__
+*.pdf
+coverage.xml
+.coverage
